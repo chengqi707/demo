@@ -35,8 +35,10 @@
     display: flex;
     gap: 32px;
     font-size: 18px;
+    align-items: baseline;
   }
   .scorebar b { color: var(--accent); font-variant-numeric: tabular-nums; }
+  .scorebar .fx { font-size: 15px; min-width: 90px; }
   .stage { position: relative; }
   canvas {
     background: var(--board);
@@ -98,13 +100,14 @@
   <div class="scorebar">
     <span>得分 <b id="score">0</b></span>
     <span>最高分 <b id="best">0</b></span>
+    <span class="fx" id="effects"></span>
   </div>
   <div class="stage">
     <canvas id="game" width="400" height="400"></canvas>
     <div class="overlay" id="overlay">
       <h2 id="overlayTitle">贪吃蛇</h2>
       <p class="final" id="overlayScore"></p>
-      <p id="overlayHint">方向键 / WASD 移动<br>空格 暂停 / 继续<br>手机可滑动或使用下方按钮</p>
+      <p id="overlayHint">方向键 / WASD 移动<br>空格 暂停 / 继续<br>手机可滑动或使用下方按钮<br>⭐双倍得分　🕐减速时钟　🛡️护身护盾　✂️瘦身果实</p>
       <button id="startBtn">开始游戏</button>
     </div>
   </div>
@@ -112,7 +115,7 @@
     <span></span><button data-dir="up">▲</button><span></span>
     <button data-dir="left">◀</button><button data-dir="down">▼</button><button data-dir="right">▶</button>
   </div>
-  <p class="hint kbd">每吃一个食物 +10 分，速度会逐渐加快，撞墙或咬到自己即结束</p>
+  <p class="hint kbd">每吃一个食物 +10 分，速度会逐渐加快，撞墙或咬到自己即结束；吃到道具可获得限时增益</p>
 
 <script>
 (() => {
@@ -126,6 +129,21 @@
   const SPEED_STEP = 6;         // 每个食物缩短的间隔
   const SCORE_PER_FOOD = 10;
 
+  // ===== 道具系统配置 =====
+  const POWERUP_TTL = 10000;    // 道具在场上存活时间（毫秒）
+  const SPAWN_MIN = 15000;      // 道具刷新间隔下限
+  const SPAWN_MAX = 25000;      // 道具刷新间隔上限
+  const DOUBLE_MS = 10000;      // 双倍得分持续
+  const SHIELD_MS = 8000;       // 护盾持续
+  const TRIM_AMOUNT = 2;        // 瘦身节数
+  const MIN_SNAKE_LEN = 3;      // 瘦身保底长度
+  const POWERUPS = [
+    { type: "double", icon: "⭐" },
+    { type: "slow",   icon: "🕐" },
+    { type: "shield", icon: "🛡️" },
+    { type: "trim",   icon: "✂️" },
+  ];
+
   const canvas = document.getElementById("game");
   const ctx = canvas.getContext("2d");
   canvas.width = GRID * CELL;
@@ -133,6 +151,7 @@
 
   const scoreEl = document.getElementById("score");
   const bestEl = document.getElementById("best");
+  const effectsEl = document.getElementById("effects");
   const overlay = document.getElementById("overlay");
   const overlayTitle = document.getElementById("overlayTitle");
   const overlayScore = document.getElementById("overlayScore");
@@ -146,9 +165,13 @@
   };
 
   let snake, dir, pendingDir, food, score, best, interval, timer, running, paused, gameOver;
+  // 道具系统状态：以游戏内累计时间 elapsed 计时，暂停时自然冻结
+  let elapsed, nextSpawnAt, powerup, doubleUntil, shieldUntil, foodEaten;
 
   best = Number(localStorage.getItem("snake-best") || 0);
   bestEl.textContent = best;
+
+  const randSpawnDelay = () => SPAWN_MIN + Math.random() * (SPAWN_MAX - SPAWN_MIN);
 
   function reset() {
     const c = Math.floor(GRID / 2);
@@ -159,7 +182,14 @@
     interval = BASE_INTERVAL;
     paused = false;
     gameOver = false;
+    elapsed = 0;
+    foodEaten = 0;
+    powerup = null;
+    doubleUntil = 0;
+    shieldUntil = 0;
+    nextSpawnAt = randSpawnDelay();
     scoreEl.textContent = "0";
+    effectsEl.textContent = "";
     placeFood();
   }
 
@@ -171,26 +201,76 @@
     food = free[Math.floor(Math.random() * free.length)] || null;
   }
 
-  function step() {
-    dir = pendingDir;
-    const head = { x: snake[0].x + dir.x, y: snake[0].y + dir.y };
+  // 道具生成：复用空闲格逻辑，不与蛇身、食物重叠
+  function placePowerup() {
+    const free = [];
+    for (let y = 0; y < GRID; y++)
+      for (let x = 0; x < GRID; x++)
+        if (!snake.some(s => s.x === x && s.y === y) &&
+            !(food && food.x === x && food.y === y)) free.push({ x, y });
+    if (!free.length) { nextSpawnAt = elapsed + randSpawnDelay(); return; }
+    const cell = free[Math.floor(Math.random() * free.length)];
+    const kind = POWERUPS[Math.floor(Math.random() * POWERUPS.length)];
+    powerup = { type: kind.type, icon: kind.icon, x: cell.x, y: cell.y, expiresAt: elapsed + POWERUP_TTL };
+  }
 
-    // 撞墙或撞到自己 → 结束
-    if (head.x < 0 || head.y < 0 || head.x >= GRID || head.y >= GRID ||
-        snake.some(s => s.x === head.x && s.y === head.y)) {
+  // 道具生效：同类效果重复吃到时刷新持续时间
+  function applyPowerup(p) {
+    if (p.type === "double") {
+      doubleUntil = elapsed + DOUBLE_MS;
+    } else if (p.type === "shield") {
+      shieldUntil = elapsed + SHIELD_MS;
+    } else if (p.type === "slow") {
+      interval = BASE_INTERVAL;
+      restartTimer();
+    } else if (p.type === "trim") {
+      for (let i = 0; i < TRIM_AMOUNT && snake.length > MIN_SNAKE_LEN; i++) snake.pop();
+    }
+  }
+
+  function step() {
+    elapsed += interval;
+
+    // 道具刷新与过期（场上最多 1 个）
+    if (!powerup && elapsed >= nextSpawnAt) placePowerup();
+    if (powerup && elapsed >= powerup.expiresAt) {
+      powerup = null;
+      nextSpawnAt = elapsed + randSpawnDelay();
+    }
+
+    dir = pendingDir;
+    let head = { x: snake[0].x + dir.x, y: snake[0].y + dir.y };
+
+    // 撞墙：护盾生效期间从对面穿出，否则结束
+    const hitWall = head.x < 0 || head.y < 0 || head.x >= GRID || head.y >= GRID;
+    if (hitWall) {
+      if (elapsed >= shieldUntil) return endGame();
+      head.x = (head.x + GRID) % GRID;
+      head.y = (head.y + GRID) % GRID;
+    }
+    // 撞到自己 → 结束（护盾不豁免）
+    if (snake.some(s => s.x === head.x && s.y === head.y)) {
       return endGame();
     }
 
     snake.unshift(head);
 
     if (food && head.x === food.x && head.y === food.y) {
-      score += SCORE_PER_FOOD;
+      foodEaten++;
+      score += SCORE_PER_FOOD * (elapsed < doubleUntil ? 2 : 1);
       scoreEl.textContent = score;
-      interval = Math.max(MIN_INTERVAL, BASE_INTERVAL - Math.floor(score / SCORE_PER_FOOD) * SPEED_STEP);
+      interval = Math.max(MIN_INTERVAL, BASE_INTERVAL - foodEaten * SPEED_STEP);
       restartTimer();
       placeFood();
     } else {
       snake.pop();
+    }
+
+    // 吃到道具（不使身体增长）
+    if (powerup && head.x === powerup.x && head.y === powerup.y) {
+      applyPowerup(powerup);
+      powerup = null;
+      nextSpawnAt = elapsed + randSpawnDelay();
     }
 
     draw();
@@ -207,6 +287,7 @@
 
     // 网格线
     ctx.strokeStyle = "rgba(255,255,255,0.04)";
+    ctx.lineWidth = 1;
     for (let i = 1; i < GRID; i++) {
       ctx.beginPath(); ctx.moveTo(i * CELL, 0); ctx.lineTo(i * CELL, canvas.height); ctx.stroke();
       ctx.beginPath(); ctx.moveTo(0, i * CELL); ctx.lineTo(canvas.width, i * CELL); ctx.stroke();
@@ -220,12 +301,35 @@
       ctx.fill();
     }
 
+    // 道具（emoji 绘制，与普通食物明显区分）
+    if (powerup) {
+      ctx.font = `${CELL - 2}px "Apple Color Emoji", "Segoe UI Emoji", sans-serif`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(powerup.icon, powerup.x * CELL + CELL / 2, powerup.y * CELL + CELL / 2 + 1);
+    }
+
     // 蛇
     snake.forEach((s, i) => {
       ctx.fillStyle = i === 0 ? "#4ade80" : "#22c55e";
       const pad = i === 0 ? 1 : 2;
       roundRect(s.x * CELL + pad, s.y * CELL + pad, CELL - pad * 2, CELL - pad * 2, 5);
     });
+
+    // 护盾生效：蛇头外圈青色光环
+    if (elapsed < shieldUntil) {
+      ctx.strokeStyle = "#22d3ee";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(snake[0].x * CELL + CELL / 2, snake[0].y * CELL + CELL / 2, CELL / 2 + 2, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    // HUD：生效中的道具图标 + 剩余秒数
+    let fx = "";
+    if (elapsed < doubleUntil) fx += `⭐${Math.ceil((doubleUntil - elapsed) / 1000)}s `;
+    if (elapsed < shieldUntil) fx += `🛡️${Math.ceil((shieldUntil - elapsed) / 1000)}s`;
+    effectsEl.textContent = fx.trim();
   }
 
   function roundRect(x, y, w, h, r) {
